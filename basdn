@@ -1,0 +1,1035 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║        BASDN — CLI Multi-Downloader  ·  All-in-One Launcher      ║
+# ║   Auto Setup · Resume · Retry · Multi-Link Paste · PEP8 Clean   ║
+# ╠══════════════════════════════════════════════════════════════════╣
+# ║  Dev    : 0xb0rn3  |  0xbv1                                     ║
+# ║  GitHub : https://github.com/0xb0rn3/Basdn                      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Usage:
+#   chmod +x basdn
+#   ./basdn                    # interactive multi-paste mode
+#   ./basdn -f links.txt       # load from file
+#   ./basdn -u URL1 URL2 ...   # direct URLs
+#   ./basdn --reset            # clear saved state & re-download all
+#   ./basdn --setup-only       # just install deps, don't download
+
+set -euo pipefail
+
+# ─── Colours ────────────────────────────────────────────────────────
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+C_WHITE='\033[0;37m'
+C_BRED='\033[1;31m'
+C_BGREEN='\033[1;32m'
+C_BYELLOW='\033[1;33m'
+C_BCYAN='\033[1;36m'
+
+# ─── Logging helpers ─────────────────────────────────────────────────
+ts()     { date '+%H:%M:%S'; }
+info()   { echo -e "${C_DIM}[$(ts)]${C_RESET} ${C_CYAN}${C_BOLD}ℹ${C_RESET}  $*"; }
+ok()     { echo -e "${C_DIM}[$(ts)]${C_RESET} ${C_BGREEN}✔${C_RESET}  $*"; }
+warn()   { echo -e "${C_DIM}[$(ts)]${C_RESET} ${C_BYELLOW}⚠${C_RESET}  $*"; }
+err()    { echo -e "${C_DIM}[$(ts)]${C_RESET} ${C_BRED}✖${C_RESET}  $*" >&2; }
+step()   { echo -e "\n${C_BCYAN}${C_BOLD}▶  $*${C_RESET}"; }
+divider(){ echo -e "${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}"; }
+
+# ─── Banner ──────────────────────────────────────────────────────────
+banner() {
+  echo -e "
+${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗
+║          ██████╗  █████╗ ███████╗██████╗ ███╗   ██╗          ║
+║          ██╔══██╗██╔══██╗██╔════╝██╔══██╗████╗  ██║          ║
+║          ██████╔╝███████║███████╗██║  ██║██╔██╗ ██║          ║
+║          ██╔══██╗██╔══██║╚════██║██║  ██║██║╚██╗██║          ║
+║          ██████╔╝██║  ██║███████║██████╔╝██║ ╚████║          ║
+║          ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═══╝          ║
+║                                                              ║
+║          Batch Auto-retry Streaming Download eNgine          ║
+╠══════════════════════════════════════════════════════════════╣
+║       v2.0  ·  CLI Multi-Downloader  ·  Resume & Retry       ║
+╠══════════════════════════════════════════════════════════════╣
+║                 Dev    :  0xb0rn3  |  0xbv1                  ║
+║          GitHub :  https://github.com/0xb0rn3/Basdn          ║
+╚══════════════════════════════════════════════════════════════╝${C_RESET}
+"
+}
+
+# ════════════════════════════════════════════════════════════════════
+#  SECTION 1 — ENVIRONMENT DETECTION & DEPENDENCY SETUP
+# ════════════════════════════════════════════════════════════════════
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="${SCRIPT_DIR}/.basdn_downloader.py"
+VENV_DIR="${SCRIPT_DIR}/.basdn_venv"
+DEPS_STAMP="${SCRIPT_DIR}/.basdn_deps_ok"
+
+# ── Find best Python ─────────────────────────────────────────────────
+find_python() {
+  for cmd in python3.12 python3.11 python3.10 python3.9 python3 python; do
+    if command -v "$cmd" &>/dev/null; then
+      local ver
+      ver=$("$cmd" -c "import sys; print(sys.version_info >= (3,8))" 2>/dev/null || true)
+      if [[ "$ver" == "True" ]]; then
+        echo "$cmd"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# ── Auto-detect pip install flags ───────────────────────────────────
+# Detects if --break-system-packages is needed (PEP 668 / Debian/Ubuntu 23+)
+get_pip_flags() {
+  local python="$1"
+  local test_out
+  # Try installing a dummy package to detect externally-managed error
+  test_out=$("$python" -m pip install --dry-run pip 2>&1 || true)
+  if echo "$test_out" | grep -qi "externally.managed\|break-system-packages"; then
+    echo "--break-system-packages"
+  else
+    echo ""
+  fi
+}
+
+# ── Install deps with fallback chain ────────────────────────────────
+install_deps() {
+  local python="$1"
+  local packages=("requests" "tqdm" "colorama")
+
+  step "Installing Python dependencies"
+  divider
+
+  # Check if already done and valid
+  if [[ -f "$DEPS_STAMP" ]]; then
+    local stamp_python
+    stamp_python=$(cat "$DEPS_STAMP" 2>/dev/null || true)
+    if [[ "$stamp_python" == "$python" ]]; then
+      # Quick sanity check — all packages importable?
+      local all_ok=true
+      for pkg in "${packages[@]}"; do
+        if ! "$python" -c "import $pkg" &>/dev/null; then
+          all_ok=false
+          break
+        fi
+      done
+      if [[ "$all_ok" == "true" ]]; then
+        ok "Dependencies already satisfied (cached)."
+        return 0
+      fi
+    fi
+  fi
+
+  # ── Strategy 1: pip with --break-system-packages auto-detect ───────
+  local pip_flags
+  pip_flags=$(get_pip_flags "$python")
+  if [[ -n "$pip_flags" ]]; then
+    info "Detected externally-managed Python env — using ${C_YELLOW}${pip_flags}${C_RESET}"
+  fi
+
+  local install_ok=false
+
+  if "$python" -m pip install --quiet --upgrade "${packages[@]}" $pip_flags 2>/dev/null; then
+    install_ok=true
+    info "Installed via pip $pip_flags"
+  fi
+
+  # ── Strategy 2: pip with --user ─────────────────────────────────────
+  if [[ "$install_ok" == "false" ]]; then
+    warn "Standard pip failed — trying --user install..."
+    if "$python" -m pip install --quiet --user "${packages[@]}" 2>/dev/null; then
+      install_ok=true
+      info "Installed via pip --user"
+    fi
+  fi
+
+  # ── Strategy 3: virtualenv ───────────────────────────────────────────
+  if [[ "$install_ok" == "false" ]]; then
+    warn "pip --user failed — creating virtualenv at ${VENV_DIR}..."
+    if "$python" -m venv "$VENV_DIR" 2>/dev/null; then
+      local venv_pip="${VENV_DIR}/bin/pip"
+      if "$venv_pip" install --quiet "${packages[@]}" 2>/dev/null; then
+        python="${VENV_DIR}/bin/python3"
+        install_ok=true
+        info "Installed inside virtualenv"
+        # Update the global PYTHON_BIN to use venv
+        PYTHON_BIN="$python"
+      fi
+    fi
+  fi
+
+  # ── Strategy 4: system package manager ──────────────────────────────
+  if [[ "$install_ok" == "false" ]]; then
+    warn "All pip strategies failed — trying system package manager..."
+    if command -v apt-get &>/dev/null; then
+      info "Detected apt — installing python3-requests python3-tqdm..."
+      sudo apt-get install -y -qq python3-requests python3-tqdm 2>/dev/null \
+        && install_ok=true
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y -q python3-requests python3-tqdm 2>/dev/null \
+        && install_ok=true
+    elif command -v pacman &>/dev/null; then
+      sudo pacman -Sy --noconfirm --quiet python-requests python-tqdm 2>/dev/null \
+        && install_ok=true
+    fi
+    # colorama may still be missing from system pkgs — warn but continue
+    warn "colorama may be missing; output will have no colour. Continuing anyway."
+  fi
+
+  if [[ "$install_ok" == "false" ]]; then
+    err "Could not install dependencies automatically."
+    err "Please run manually:  pip3 install requests tqdm colorama"
+    exit 1
+  fi
+
+  # Stamp success
+  echo "$python" > "$DEPS_STAMP"
+  ok "All dependencies ready."
+}
+
+# ── Verify pip is available ──────────────────────────────────────────
+ensure_pip() {
+  local python="$1"
+  if ! "$python" -m pip --version &>/dev/null; then
+    warn "pip not found — attempting to bootstrap it..."
+    if command -v curl &>/dev/null; then
+      curl -sS https://bootstrap.pypa.io/get-pip.py | "$python" - --quiet \
+        || true
+    elif command -v wget &>/dev/null; then
+      wget -qO- https://bootstrap.pypa.io/get-pip.py | "$python" - --quiet \
+        || true
+    fi
+    if ! "$python" -m pip --version &>/dev/null; then
+      err "Could not install pip. Install it manually: sudo apt install python3-pip"
+      exit 1
+    fi
+    ok "pip bootstrapped."
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+#  SECTION 2 — MULTI-LINK PASTE HANDLER (Bash side)
+# ════════════════════════════════════════════════════════════════════
+# This gives a clean paste UI before handing off to Python.
+# Supports: paste a block of links at once, one-by-one, or from file.
+
+multilink_collector() {
+  # ── IMPORTANT: ALL UI output goes to stderr (>&2) ──────────────────
+  # This function is called as:  TMP_LINKS=$(multilink_collector)
+  # so stdout must carry ONLY the tmp file path at the end.
+  # Every echo/warn/ok/info inside here must use >&2.
+
+  echo -e "
+${C_BCYAN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗
+║              MULTI-LINK PASTE HANDLER                        ║
+╚══════════════════════════════════════════════════════════════╝${C_RESET}
+${C_WHITE}Paste all your links at once (space or newline separated),
+type them one by one, or mix both methods.
+
+${C_BOLD}Controls:${C_RESET}
+  ${C_GREEN}Enter${C_RESET}           → add link(s) / next
+  ${C_YELLOW}DONE${C_RESET} + Enter   → finish and start downloading
+  ${C_YELLOW}LIST${C_RESET} + Enter   → show collected links
+  ${C_YELLOW}CLEAR${C_RESET} + Enter  → remove all and start over
+  ${C_RED}Ctrl+D${C_RESET}          → finish (same as DONE)
+  ${C_RED}Ctrl+C${C_RESET}          → cancel / exit
+${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}" >&2
+
+  local -a LINKS=()
+  local line token added
+
+  while true; do
+    # Prompt to stderr so it shows on screen (not captured)
+    echo -ne "${C_GREEN}${C_BOLD}[${#LINKS[@]} links] ${C_RESET}${C_WHITE}Paste/type URL(s) or command: ${C_RESET}" >&2
+
+    if ! IFS= read -r line; then
+      echo "" >&2
+      break   # Ctrl+D / EOF → done
+    fi
+
+    # Trim leading/trailing whitespace from the whole line
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # ── Single-word commands ──────────────────────────────────────────
+    case "${line^^}" in
+      DONE)
+        break
+        ;;
+      LIST)
+        if [[ ${#LINKS[@]} -eq 0 ]]; then
+          echo -e "  ${C_BYELLOW}⚠  No links collected yet.${C_RESET}" >&2
+        else
+          echo -e "\n${C_BCYAN}Collected links (${#LINKS[@]}):${C_RESET}" >&2
+          local i=1
+          for l in "${LINKS[@]}"; do
+            echo -e "  ${C_DIM}${i}.${C_RESET} ${C_YELLOW}${l}${C_RESET}" >&2
+            ((i++))
+          done
+          echo "" >&2
+        fi
+        continue
+        ;;
+      CLEAR)
+        LINKS=()
+        echo -e "  ${C_BGREEN}✔ Link list cleared.${C_RESET}" >&2
+        continue
+        ;;
+    esac
+
+    # ── Split line on whitespace — handles space-dumped URL blocks ────
+    # e.g. "https://a.com/x.pkg https://b.com/y.pkg https://c.com/z.pkg"
+    # is treated as 3 separate URLs, not 1 broken string.
+    added=0
+    IFS=$' \t' read -r -a tokens <<< "$line"
+
+    for token in "${tokens[@]}"; do
+      # Trim each token
+      token="${token#"${token%%[![:space:]]*}"}"
+      token="${token%"${token##*[![:space:]]}"}"
+      [[ -z "$token" ]] && continue
+
+      if echo "$token" | grep -qiE '^(https?|ftp)://'; then
+        LINKS+=("$token")
+        ((added++))
+      else
+        # Non-URL token on a multi-token line → skip silently
+        # Non-URL token on a solo line → ask user
+        if [[ ${#tokens[@]} -eq 1 ]]; then
+          echo -e "  ${C_BYELLOW}⚠  Doesn't look like a URL:${C_RESET} ${C_DIM}${token:0:80}${C_RESET}" >&2
+          echo -ne "  ${C_YELLOW}Add anyway? [y/N]: ${C_RESET}" >&2
+          local confirm
+          IFS= read -r confirm </dev/tty
+          if [[ "${confirm,,}" == "y" ]]; then
+            LINKS+=("$token")
+            ((added++))
+          fi
+        fi
+      fi
+    done
+
+    if [[ $added -gt 0 ]]; then
+      echo -e "  ${C_BGREEN}✔ ${added} URL(s) added${C_RESET} ${C_DIM}(${#LINKS[@]} total)${C_RESET}" >&2
+    fi
+  done
+
+  if [[ ${#LINKS[@]} -eq 0 ]]; then
+    echo -e "  ${C_BYELLOW}⚠  No links collected. Exiting.${C_RESET}" >&2
+    exit 0
+  fi
+
+  echo -e "\n${C_BGREEN}${C_BOLD}✔ ${#LINKS[@]} link(s) queued — starting downloads...${C_RESET}\n" >&2
+
+  # Write URLs to tmp file — ONE URL per line (clean for Python)
+  local tmp_file
+  tmp_file=$(mktemp /tmp/basdn_links_XXXXXX.txt)
+  printf '%s\n' "${LINKS[@]}" > "$tmp_file"
+
+  # ── Only stdout output: the tmp file path (what $() captures) ──────
+  echo "$tmp_file"
+}
+
+# ════════════════════════════════════════════════════════════════════
+#  SECTION 3 — EMBEDDED PYTHON DOWNLOADER  (PEP 8 compliant)
+# ════════════════════════════════════════════════════════════════════
+
+write_python_script() {
+  cat > "$PYTHON_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+BASDN — Core Engine (PEP 8 compliant)
+Supports: HTTP resume, exponential-backoff retry,
+          queue management, state persistence.
+
+Dev    : 0xb0rn3  |  0xbv1
+GitHub : https://github.com/0xb0rn3/Basdn
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+import requests
+from tqdm import tqdm
+
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    HAS_COLOR = True
+except ImportError:
+    HAS_COLOR = False
+
+    class Fore:
+        RED = GREEN = YELLOW = CYAN = MAGENTA = WHITE = BLUE = RESET = ""
+
+    class Style:
+        BRIGHT = DIM = RESET_ALL = ""
+
+
+# ── Constants ─────────────────────────────────────────────────────────
+CHUNK_SIZE = 1024 * 1024        # 1 MiB per read
+MAX_RETRIES = 10
+RETRY_BASE_DELAY = 5            # seconds; doubles each attempt
+RETRY_MAX_DELAY = 120           # cap at 2 minutes
+CONNECT_TIMEOUT = 30            # seconds
+READ_TIMEOUT = 60               # seconds
+STATE_SAVE_INTERVAL = 10        # seconds between incremental state saves
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+}
+
+
+# ── Formatting helpers ────────────────────────────────────────────────
+
+def human_size(num_bytes: int) -> str:
+    """Return a human-readable file size string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PB"
+
+
+def human_eta(seconds: float) -> str:
+    """Return a human-readable ETA string."""
+    if seconds < 0 or seconds > 60 * 60 * 24 * 7:
+        return "∞"
+    return str(timedelta(seconds=int(seconds)))
+
+
+def log(level: str, msg: str) -> None:
+    """Emit a timestamped, coloured log line."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    palette = {
+        "info":  (Fore.CYAN,    "ℹ"),
+        "ok":    (Fore.GREEN,   "✔"),
+        "warn":  (Fore.YELLOW,  "⚠"),
+        "error": (Fore.RED,     "✖"),
+        "retry": (Fore.MAGENTA, "↻"),
+        "start": (Fore.BLUE,    "▶"),
+        "skip":  (Fore.YELLOW,  "⏭"),
+    }
+    color, icon = palette.get(level, (Fore.WHITE, "•"))
+    print(
+        f"{Style.DIM}[{timestamp}]{Style.RESET_ALL} "
+        f"{color}{Style.BRIGHT}{icon}{Style.RESET_ALL} {msg}"
+    )
+
+
+# ── State helpers ─────────────────────────────────────────────────────
+
+def url_key(url: str) -> str:
+    """Return a stable hash key for a URL."""
+    return hashlib.md5(url.encode()).hexdigest()
+
+
+def load_state(state_file: Path) -> dict:
+    """Load persisted download state from disk."""
+    if state_file.exists():
+        try:
+            with open(state_file, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_state(state: dict, state_file: Path) -> None:
+    """Persist download state to disk (atomic write)."""
+    tmp = state_file.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        tmp.replace(state_file)
+    except OSError as exc:
+        log("warn", f"Could not save state: {exc}")
+
+
+# ── Filename resolution ───────────────────────────────────────────────
+
+def resolve_filename(url: str, response: requests.Response = None) -> str:
+    """
+    Attempt to resolve a clean filename from:
+      1. Content-Disposition header
+      2. URL path component
+      3. MD5-based fallback
+    """
+    if response is not None:
+        content_disp = response.headers.get("Content-Disposition", "")
+        if "filename=" in content_disp:
+            raw = content_disp.split("filename=")[-1].strip().strip("\"'")
+            if raw:
+                return raw
+
+    parsed = urlparse(url)
+    name = unquote(parsed.path.split("/")[-1])
+    if name and "." in name:
+        return name
+
+    fallback_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    return f"download_{fallback_hash}.pkg"
+
+
+# ── Core download ─────────────────────────────────────────────────────
+
+def download_file(
+    url: str,
+    state: dict,
+    download_dir: Path,
+    index: int,
+    total: int,
+) -> bool:
+    """
+    Download a single file with:
+      - HTTP Range-based resume
+      - Exponential-backoff retry (up to MAX_RETRIES)
+      - Real-time tqdm progress bar
+      - Periodic state persistence
+      - Final size verification
+    Returns True on success, False on permanent failure.
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    state_file = download_dir / ".download_state.json"
+    key = url_key(url)
+    file_state = state.get(key, {})
+
+    filename = file_state.get("filename")
+    total_size = file_state.get("total_size", 0)
+    supports_resume = True
+
+    # ── HEAD probe to get metadata ────────────────────────────────────
+    if not filename or not total_size:
+        for probe_attempt in range(1, 4):
+            try:
+                head = requests.head(
+                    url,
+                    headers=DEFAULT_HEADERS,
+                    timeout=CONNECT_TIMEOUT,
+                    allow_redirects=True,
+                )
+                head.raise_for_status()
+                filename = filename or resolve_filename(url, head)
+                total_size = int(head.headers.get("content-length", 0))
+                supports_resume = (
+                    "bytes" in head.headers.get("Accept-Ranges", "")
+                )
+                break
+            except requests.RequestException as exc:
+                if probe_attempt == 3:
+                    log("warn", f"HEAD probe failed; will attempt GET directly: {exc}")
+                    filename = filename or resolve_filename(url)
+                    supports_resume = False
+
+    dest = download_dir / filename
+    downloaded = file_state.get("downloaded", 0)
+
+    # ── Already complete? ─────────────────────────────────────────────
+    if dest.exists() and total_size > 0 and downloaded >= total_size:
+        log("skip", f"[{index}/{total}] Already complete: {Fore.GREEN}{filename}")
+        state[key] = {**file_state, "status": "done"}
+        save_state(state, state_file)
+        return True
+
+    # ── Reconcile partial file on disk ────────────────────────────────
+    actual_on_disk = dest.stat().st_size if dest.exists() else 0
+    if actual_on_disk != downloaded:
+        log(
+            "warn",
+            f"Disk size ({human_size(actual_on_disk)}) ≠ "
+            f"saved state ({human_size(downloaded)}) — adjusting.",
+        )
+        downloaded = actual_on_disk
+
+    print()
+    log("start", f"[{index}/{total}] {Fore.CYAN}{Style.BRIGHT}{filename}")
+    if total_size:
+        log("info", f"Total size : {Fore.YELLOW}{human_size(total_size)}")
+    if downloaded > 0:
+        log("info", f"Resuming at: {Fore.YELLOW}{human_size(downloaded)}")
+
+    # ── Retry loop ────────────────────────────────────────────────────
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            req_headers = dict(DEFAULT_HEADERS)
+            if downloaded > 0 and supports_resume:
+                req_headers["Range"] = f"bytes={downloaded}-"
+
+            response = requests.get(
+                url,
+                headers=req_headers,
+                stream=True,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=True,
+            )
+
+            # Server ignored Range — must restart
+            if downloaded > 0 and response.status_code == 200:
+                log("warn", "Server returned 200 (no resume) — restarting from zero.")
+                downloaded = 0
+                if dest.exists():
+                    dest.unlink()
+
+            elif response.status_code not in (200, 206):
+                response.raise_for_status()
+
+            # Refine metadata from actual response
+            if not filename or filename.startswith("download_"):
+                filename = resolve_filename(url, response)
+                dest = download_dir / filename
+
+            if not total_size:
+                total_size = int(response.headers.get("content-length", 0))
+                content_range = response.headers.get("content-range", "")
+                if "/" in content_range:
+                    try:
+                        total_size = int(content_range.split("/")[-1])
+                    except ValueError:
+                        pass
+
+            open_mode = (
+                "ab"
+                if downloaded > 0 and response.status_code == 206
+                else "wb"
+            )
+            if open_mode == "wb":
+                downloaded = 0
+
+            last_save_time = time.time()
+
+            with open(dest, open_mode) as out_fh, tqdm(
+                total=total_size if total_size else None,
+                initial=downloaded,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=(
+                    f"  {Fore.GREEN}{filename[:45]:<45}{Style.RESET_ALL}"
+                ),
+                dynamic_ncols=True,
+                colour="green",
+                bar_format=(
+                    "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}, {rate_fmt}]"
+                ),
+            ) as progress:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    out_fh.write(chunk)
+                    chunk_len = len(chunk)
+                    downloaded += chunk_len
+                    progress.update(chunk_len)
+
+                    now = time.time()
+                    if now - last_save_time >= STATE_SAVE_INTERVAL:
+                        state[key] = {
+                            "url": url,
+                            "filename": filename,
+                            "total_size": total_size,
+                            "downloaded": downloaded,
+                            "status": "in_progress",
+                            "last_updated": datetime.now().isoformat(),
+                        }
+                        save_state(state, state_file)
+                        last_save_time = now
+
+            # ── Verify ───────────────────────────────────────────────
+            final_size = dest.stat().st_size
+            if total_size and final_size != total_size:
+                raise IOError(
+                    f"Size mismatch: got {human_size(final_size)}, "
+                    f"expected {human_size(total_size)}"
+                )
+
+            state[key] = {
+                "url": url,
+                "filename": filename,
+                "total_size": total_size,
+                "downloaded": final_size,
+                "status": "done",
+                "completed_at": datetime.now().isoformat(),
+            }
+            save_state(state, state_file)
+            log(
+                "ok",
+                f"Complete: {Fore.GREEN}{Style.BRIGHT}{filename} "
+                f"({human_size(final_size)})",
+            )
+            return True
+
+        except (requests.RequestException, IOError, OSError) as exc:
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+            if attempt < MAX_RETRIES:
+                log("retry", f"Attempt {attempt}/{MAX_RETRIES} failed — {exc}")
+                log(
+                    "retry",
+                    f"Retry in {delay}s "
+                    f"(saved: {human_size(downloaded)} — will resume)",
+                )
+                state[key] = {
+                    "url": url,
+                    "filename": filename,
+                    "total_size": total_size,
+                    "downloaded": downloaded,
+                    "status": "retrying",
+                    "last_error": str(exc),
+                    "last_updated": datetime.now().isoformat(),
+                }
+                save_state(state, state_file)
+                time.sleep(delay)
+            else:
+                log("error", f"All {MAX_RETRIES} attempts exhausted for: {Fore.RED}{url}")
+                log("error", f"Last error: {exc}")
+                state[key] = {
+                    "url": url,
+                    "filename": filename,
+                    "total_size": total_size,
+                    "downloaded": downloaded,
+                    "status": "failed",
+                    "last_error": str(exc),
+                    "last_updated": datetime.now().isoformat(),
+                }
+                save_state(state, state_file)
+                return False
+
+    return False  # should not be reached
+
+
+# ── Queue runner ──────────────────────────────────────────────────────
+
+def run_queue(urls: list, download_dir: Path) -> None:
+    """Process a list of URLs sequentially with summary reporting."""
+    state_file = download_dir / ".download_state.json"
+    state = load_state(state_file)
+    total = len(urls)
+
+    print(
+        f"\n{Fore.CYAN}{Style.BRIGHT}{'─' * 62}\n"
+        f"  Queue  : {Fore.YELLOW}{total} file(s)\n"
+        f"{Fore.CYAN}  Output : {Fore.YELLOW}{download_dir.resolve()}\n"
+        f"{Fore.CYAN}{'─' * 62}{Style.RESET_ALL}\n"
+    )
+
+    results = {"done": [], "failed": [], "skipped": []}
+
+    for idx, raw_url in enumerate(urls, start=1):
+        url = raw_url.strip()
+        if not url or url.startswith("#"):
+            continue
+
+        key = url_key(url)
+        existing = state.get(key, {})
+
+        if existing.get("status") == "done":
+            dest = download_dir / existing.get("filename", "")
+            if dest.exists():
+                log(
+                    "skip",
+                    f"[{idx}/{total}] Already downloaded: "
+                    f"{Fore.GREEN}{existing.get('filename', url)}",
+                )
+                results["skipped"].append(url)
+                continue
+
+        success = download_file(url, state, download_dir, idx, total)
+        (results["done"] if success else results["failed"]).append(url)
+
+    # ── Summary ───────────────────────────────────────────────────────
+    print(
+        f"\n{Fore.CYAN}{Style.BRIGHT}{'═' * 62}\n"
+        f"  DOWNLOAD SUMMARY\n"
+        f"{'═' * 62}{Style.RESET_ALL}\n"
+        f"  {Fore.GREEN}✔ Completed : {len(results['done'])}\n"
+        f"  {Fore.YELLOW}⏭ Skipped   : {len(results['skipped'])}\n"
+        f"  {Fore.RED}✖ Failed    : {len(results['failed'])}{Style.RESET_ALL}"
+    )
+
+    if results["failed"]:
+        print(f"\n{Fore.RED}Failed URLs (re-run to resume):{Style.RESET_ALL}")
+        for failed_url in results["failed"]:
+            print(f"  • {failed_url}")
+
+    print(
+        f"\n{Fore.CYAN}Files saved to: "
+        f"{Fore.YELLOW}{Style.BRIGHT}{download_dir.resolve()}{Style.RESET_ALL}\n"
+    )
+
+
+# ── Entry point ───────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="BASDN — Resume · Retry · Queue",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-u", "--urls",
+        nargs="+",
+        metavar="URL",
+        help="One or more direct download URLs",
+    )
+    parser.add_argument(
+        "-f", "--file",
+        metavar="FILE",
+        help="Text file containing one URL per line",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        metavar="DIR",
+        default="./basdn_downloads",
+        help="Output directory (default: ./basdn_downloads)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Clear saved state and re-download everything",
+    )
+    args = parser.parse_args()
+
+    download_dir = Path(args.output)
+    state_file = download_dir / ".download_state.json"
+
+    if args.reset and state_file.exists():
+        state_file.unlink()
+        log("ok", "Download state cleared — starting fresh.")
+
+    urls: list[str] = []
+
+    if args.file:
+        fp = Path(args.file)
+        if not fp.exists():
+            log("error", f"Link file not found: {fp}")
+            sys.exit(1)
+        with open(fp, encoding="utf-8") as fh:
+            urls = [
+                line.strip()
+                for line in fh
+                if line.strip() and not line.startswith("#")
+            ]
+        log("info", f"Loaded {len(urls)} URL(s) from {fp}")
+
+    elif args.urls:
+        urls = args.urls
+
+    else:
+        log("error", "No URLs provided. Use -f FILE or -u URL [URL ...]")
+        parser.print_help()
+        sys.exit(1)
+
+    if not urls:
+        log("warn", "URL list is empty — nothing to do.")
+        sys.exit(0)
+
+    try:
+        run_queue(urls, download_dir)
+    except KeyboardInterrupt:
+        print(
+            f"\n\n{Fore.YELLOW}{Style.BRIGHT}⏸  Interrupted by user.{Style.RESET_ALL}\n"
+            f"{Fore.CYAN}Progress saved. Re-run to resume.{Style.RESET_ALL}\n"
+        )
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  chmod +x "$PYTHON_SCRIPT"
+  ok "Python engine written to ${PYTHON_SCRIPT}"
+}
+
+# ════════════════════════════════════════════════════════════════════
+#  SECTION 4 — ARGUMENT PARSING & MAIN FLOW
+# ════════════════════════════════════════════════════════════════════
+
+usage_flow() {
+  echo -e "
+${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗
+║                        USAGE FLOW                            ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  ${C_RESET}${C_BYELLOW}MODE 1${C_RESET}${C_CYAN}${C_BOLD}  — Interactive paste  ${C_RESET}${C_DIM}(default, no args)${C_RESET}${C_CYAN}${C_BOLD}             ║
+║  ${C_RESET}${C_WHITE}  ./basdn${C_RESET}${C_CYAN}${C_BOLD}                                               ║
+║  ${C_RESET}${C_DIM}  Launches multi-link paste handler. Paste URLs            ║
+║  space-separated or one per line. Type DONE to start.${C_RESET}${C_CYAN}${C_BOLD}       ║
+║                                                              ║
+║  ${C_RESET}${C_BYELLOW}MODE 2${C_RESET}${C_CYAN}${C_BOLD}  — File mode                                         ║
+║  ${C_RESET}${C_WHITE}  ./basdn -f links.txt${C_RESET}${C_CYAN}${C_BOLD}                                   ║
+║  ${C_RESET}${C_DIM}  Read URLs from a text file. One URL per line.            ║
+║  Lines starting with # are treated as comments.${C_RESET}${C_CYAN}${C_BOLD}             ║
+║                                                              ║
+║  ${C_RESET}${C_BYELLOW}MODE 3${C_RESET}${C_CYAN}${C_BOLD}  — Direct URLs                                       ║
+║  ${C_RESET}${C_WHITE}  ./basdn -u URL1 URL2 URL3 ...${C_RESET}${C_CYAN}${C_BOLD}                          ║
+║  ${C_RESET}${C_DIM}  Pass one or more URLs directly on the command line.${C_RESET}${C_CYAN}${C_BOLD}          ║
+║                                                              ║
+╠══════════════════════════════════════════════════════════════╣
+║                         OPTIONS                              ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  ${C_RESET}${C_WHITE}-f  --file   FILE${C_RESET}${C_DIM}   Load URLs from a text file${C_RESET}${C_CYAN}${C_BOLD}              ║
+║  ${C_RESET}${C_WHITE}-u  --urls   URL …${C_RESET}${C_DIM}  One or more direct download URLs${C_RESET}${C_CYAN}${C_BOLD}         ║
+║  ${C_RESET}${C_WHITE}-o  --output DIR${C_RESET}${C_DIM}    Output directory  ${C_RESET}${C_DIM}[default: ./basdn_downloads]${C_RESET}${C_CYAN}${C_BOLD}  ║
+║  ${C_RESET}${C_WHITE}    --reset${C_RESET}${C_DIM}         Wipe saved state and re-download all${C_RESET}${C_CYAN}${C_BOLD}     ║
+║  ${C_RESET}${C_WHITE}    --setup-only${C_RESET}${C_DIM}    Install deps only, skip download${C_RESET}${C_CYAN}${C_BOLD}         ║
+║  ${C_RESET}${C_WHITE}-h  --help${C_RESET}${C_DIM}          Show this help${C_RESET}${C_CYAN}${C_BOLD}                          ║
+║                                                              ║
+╠══════════════════════════════════════════════════════════════╣
+║                    PASTE HANDLER KEYS                        ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  ${C_RESET}${C_BGREEN}DONE${C_RESET}${C_DIM}    + Enter  →  Finish and start downloading${C_RESET}${C_CYAN}${C_BOLD}          ║
+║  ${C_RESET}${C_BYELLOW}LIST${C_RESET}${C_DIM}    + Enter  →  Show all collected links${C_RESET}${C_CYAN}${C_BOLD}              ║
+║  ${C_RESET}${C_BYELLOW}CLEAR${C_RESET}${C_DIM}   + Enter  →  Remove all links and start over${C_RESET}${C_CYAN}${C_BOLD}       ║
+║  ${C_RESET}${C_RED}Ctrl+D${C_RESET}${C_DIM}             →  Finish  (same as DONE)${C_RESET}${C_CYAN}${C_BOLD}                ║
+║  ${C_RESET}${C_RED}Ctrl+C${C_RESET}${C_DIM}             →  Cancel and exit${C_RESET}${C_CYAN}${C_BOLD}                       ║
+║                                                              ║
+╠══════════════════════════════════════════════════════════════╣
+║                    RESUME & RETRY                            ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  ${C_RESET}${C_DIM}  • Interrupted downloads resume from last saved byte       ║
+║  • Up to 10 retries with exponential backoff per file       ║
+║  • Re-run at any time — completed files are skipped         ║
+║  • State saved every 10s to .download_state.json${C_RESET}${C_CYAN}${C_BOLD}           ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝${C_RESET}
+"
+}
+
+# Keep 'usage' as alias for -h flag
+usage() { usage_flow; }
+
+# ── Default values ───────────────────────────────────────────────────
+LINK_FILE=""
+DIRECT_URLS=()
+OUTPUT_DIR="./basdn_downloads"
+RESET_FLAG=""
+SETUP_ONLY=false
+
+# ── Parse args ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--file)
+      LINK_FILE="$2"; shift 2 ;;
+    -u|--urls)
+      shift
+      while [[ $# -gt 0 && "$1" != -* ]]; do
+        DIRECT_URLS+=("$1"); shift
+      done
+      ;;
+    -o|--output)
+      OUTPUT_DIR="$2"; shift 2 ;;
+    --reset)
+      RESET_FLAG="--reset"; shift ;;
+    --setup-only)
+      SETUP_ONLY=true; shift ;;
+    -h|--help)
+      banner; usage; exit 0 ;;
+    *)
+      err "Unknown argument: $1"; usage; exit 1 ;;
+  esac
+done
+
+# ════════════════════════════════════════════════════════════════════
+#  MAIN EXECUTION
+# ════════════════════════════════════════════════════════════════════
+banner
+usage_flow
+
+# ── 1. Python detection ──────────────────────────────────────────────
+step "Detecting Python interpreter"
+divider
+if ! PYTHON_BIN=$(find_python); then
+  err "Python 3.8+ not found."
+  err "Install it: sudo apt install python3   (or dnf/pacman equivalent)"
+  exit 1
+fi
+PYVER=$("$PYTHON_BIN" --version 2>&1)
+ok "Using: ${C_YELLOW}${PYTHON_BIN}${C_RESET}  (${C_DIM}${PYVER}${C_RESET})"
+
+# ── 2. Ensure pip ────────────────────────────────────────────────────
+ensure_pip "$PYTHON_BIN"
+
+# ── 3. Install / verify dependencies ────────────────────────────────
+install_deps "$PYTHON_BIN"
+
+# ── 4. Write Python engine ───────────────────────────────────────────
+step "Preparing download engine"
+divider
+write_python_script
+
+if [[ "$SETUP_ONLY" == "true" ]]; then
+  ok "Setup complete. Run ./basdn to start downloading."
+  exit 0
+fi
+
+# ── 5. Collect URLs ──────────────────────────────────────────────────
+TMP_LINKS=""
+
+if [[ -n "$LINK_FILE" ]]; then
+  # File mode — pass straight to Python
+  if [[ ! -f "$LINK_FILE" ]]; then
+    err "Link file not found: $LINK_FILE"
+    exit 1
+  fi
+  LINK_COUNT=$(grep -cE '^https?://' "$LINK_FILE" 2>/dev/null || echo 0)
+  ok "Link file: ${C_YELLOW}${LINK_FILE}${C_RESET} (${LINK_COUNT} URLs)"
+
+elif [[ ${#DIRECT_URLS[@]} -gt 0 ]]; then
+  # Direct URL mode
+  TMP_LINKS=$(mktemp /tmp/basdn_links_XXXXXX.txt)
+  printf '%s\n' "${DIRECT_URLS[@]}" > "$TMP_LINKS"
+  ok "Using ${#DIRECT_URLS[@]} URL(s) from command line."
+
+else
+  # Interactive multi-paste mode
+  step "Multi-Link Paste Mode"
+  TMP_LINKS=$(multilink_collector)
+fi
+
+# ── 6. Build Python command ──────────────────────────────────────────
+PY_CMD=("$PYTHON_BIN" "$PYTHON_SCRIPT" "-o" "$OUTPUT_DIR")
+
+if [[ -n "$RESET_FLAG" ]]; then
+  PY_CMD+=("$RESET_FLAG")
+fi
+
+if [[ -n "$LINK_FILE" ]]; then
+  PY_CMD+=("-f" "$LINK_FILE")
+elif [[ -n "$TMP_LINKS" ]]; then
+  PY_CMD+=("-f" "$TMP_LINKS")
+fi
+
+# ── 7. Run ───────────────────────────────────────────────────────────
+step "Starting download queue"
+divider
+"${PY_CMD[@]}"
+EXIT_CODE=$?
+
+# ── 8. Cleanup temp file ─────────────────────────────────────────────
+if [[ -n "$TMP_LINKS" && -f "$TMP_LINKS" ]]; then
+  rm -f "$TMP_LINKS"
+fi
+
+exit $EXIT_CODE
